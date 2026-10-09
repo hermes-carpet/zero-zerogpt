@@ -19,8 +19,7 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  # Lowercase owner is required for Docker tags.
-  IMAGE_NAME: ${{ github.repository_owner | lower }}/zero-zerogpt
+  IMAGE_NAME: hermes-carpet/zero-zerogpt  # Docker tags must be lowercase
 
 jobs:
   docker:
