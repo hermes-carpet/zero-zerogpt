@@ -1,0 +1,59 @@
+# Keep this fork in lockstep with upstream (Oct4Pie/zero-zerogpt).
+# Our only contribution is the added Docker files, so a merge of
+# upstream/main is always clean unless upstream adds a file with a
+# path we also added (which is then surfaced for manual resolution).
+#
+# Run it manually from the Actions tab (or via `gh workflow run`).
+#
+#   # default: merge upstream/main into main
+#   gh workflow run sync-upstream.yml -R hermes-carpet/zero-zerogpt
+#
+#   # or a specific upstream ref:
+#   gh workflow run sync-upstream.yml -R hermes-carpet/zero-zerogpt \
+#        -f ref=eb5c435
+
+name: Sync upstream
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream ref to merge (branch, tag, or commit SHA). Default: main"
+        required: false
+        default: "main"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout our main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add upstream remote + fetch
+        run: |
+          git remote add upstream https://github.com/Oct4Pie/zero-zerogpt.git
+          git fetch --no-tags upstream "$UPSTREAM_REF"
+        env:
+          UPSTREAM_REF: ${{ github.event.inputs.ref }}
+
+      - name: Merge upstream into main
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-edit "FETCH_HEAD" \
+            -m "chore: sync with upstream (${UPSTREAM_REF} -> main)"
+        env:
+          UPSTREAM_REF: ${{ github.event.inputs.ref }}
+
+      - name: Push merged main
+        run: git push origin HEAD:main

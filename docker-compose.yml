@@ -1,0 +1,7 @@
+services:
+  zero-zerogpt:
+    image: ghcr.io/hermes-carpet/zero-zerogpt:latest
+    container_name: zero-zerogpt
+    ports:
+      - "8080:80"
+    restart: unless-stopped
