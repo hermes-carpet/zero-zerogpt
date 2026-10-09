@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
 # Super-slim static image for zero-zerogpt (React 18 SPA).
-# Multi-stage: node:alpine builds, nginx:alpine serves. Final image ~6 MB + ~1 MB assets.
+# Multi-stage: node:20-alpine builds (never shipped), chainguard/nginx serves.
+# Final image ~15 MB compressed (vs ~26 MB on nginx:alpine).
 
 # ---- build stage --------------------------------------------------------
 FROM node:20-alpine AS build
@@ -19,10 +20,17 @@ ARG PUBLIC_URL=/
 RUN npm run build
 
 # ---- runtime stage ------------------------------------------------------
-FROM nginx:1.27-alpine
+# Chainguard (Wolfi-based) nginx: non-root, no shell, no package manager,
+# minimal attack surface. Serves the same nginx.conf as the alpine variant.
+FROM cgr.dev/chainguard/nginx
+WORKDIR /usr/share/nginx/html
 COPY nginx.conf /etc/nginx/conf.d/default.conf
-COPY --from=build /app/build /usr/share/nginx/html
+COPY --from=build /app/build .
 EXPOSE 80
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD wget -qO- http://127.0.0.1/ >/dev/null 2>&1 || exit 1
-CMD ["nginx", "-g", "daemon off;"]
+# No HEALTHCHECK: this image has no wget/curl/busybox to probe with.
+# Diagnostics instead:
+#   - `docker logs <ctr>`          -> nginx access/error logs (image CMD routes to stderr)
+#   - `docker run --rm --entrypoint /usr/sbin/nginx <image> -T`  -> dump full config
+# No explicit CMD: the image's default (entrypoint=/usr/sbin/nginx,
+# CMD=[-c /etc/nginx/nginx.conf -e /dev/stderr -g "daemon off;"]) launches
+# nginx in the foreground; it self-drops to its configured unprivileged user.
