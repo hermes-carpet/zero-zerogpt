@@ -1,59 +1,327 @@
 # Keep this fork in lockstep with upstream (Oct4Pie/zero-zerogpt).
-# Our only contribution is the added Docker files, so a merge of
-# upstream/main is always clean unless upstream adds a file with a
-# path we also added (which is then surfaced for manual resolution).
+# Ported (right-sized) from hermes-carpet/presenton upstream-sync.yml.
 #
-# Run it manually from the Actions tab (or via `gh workflow run`).
+# This fork only ADDS files (Dockerfile, nginx.conf, docker files) and does not
+# edit upstream source, so an upstream/main merge is clean unless upstream adds
+# a file at a path we also added (a real conflict, surfaced for a human).
 #
-#   # default: merge upstream/main into main
-#   gh workflow run sync-upstream.yml -R hermes-carpet/zero-zerogpt
+# Two jobs, so unreviewed upstream code never runs where the write token is:
+#   - sync (READ-ONLY): fetches + merges upstream, then runs `npm test` and a
+#     build (which EXECUTES upstream code) with only a contents:read token.
+#     Uploads the merge as a git bundle + the test result.
+#   - publish (WRITE): the only job with a write token. It never runs the
+#     merged code — it just pushes the exactly-tested bundle to main (fast
+#     forward) and kicks off the Docker + GitHub Pages builds.
 #
-#   # or a specific upstream ref:
-#   gh workflow run sync-upstream.yml -R hermes-carpet/zero-zerogpt \
-#        -f ref=eb5c435
+# Gating (a bad upstream commit can never reach main or a published image):
+#   - merge conflict        -> nothing pushed; inspect branch sync/conflict-<sha>; run goes red
+#   - npm test / build fails -> nothing pushed; inspect branch sync/failed-<sha>; run goes red
+#   - upstream touched .github/   -> blocked until you re-run with reviewed_upstream_sha
+#                                   (a workflow the fork would then run with its secrets)
+#   - nothing new from upstream    -> no-op, exit quickly
+#
+# Triggers:
+#   - weekly, Thursday 09:00 America/New_York (DST-aware via the cron timezone)
+#   - manually:
+#       gh workflow run sync-upstream.yml -R hermes-carpet/zero-zerogpt
+#       # specific upstream ref:
+#       gh workflow run sync-upstream.yml -R hermes-carpet/zero-zerogpt -f ref=<sha>
 
 name: Sync upstream
 
 on:
+  schedule:
+    - cron: "0 9 * * 4"          # Thu 09:00
+      timezone: America/New_York
   workflow_dispatch:
     inputs:
       ref:
         description: "Upstream ref to merge (branch, tag, or commit SHA). Default: main"
         required: false
         default: "main"
+      reviewed_upstream_sha:
+        description: >-
+          Full 40-char upstream commit SHA whose .github/ changes you have reviewed.
+          Only needed if upstream changed files under .github/.
+        required: false
+        default: ""
 
 permissions:
-  contents: write
+  contents: read          # job-level defaults: the code-executing job gets no write
 
 concurrency:
   group: sync-upstream
   cancel-in-progress: false
 
+env:
+  UPSTREAM_REPO: Oct4Pie/zero-zerogpt
+  UPSTREAM_BRANCH: main
+  BASE_BRANCH: main
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
 jobs:
   sync:
+    name: Merge upstream and build (read-only)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      new: ${{ steps.upstream.outputs.new }}
+      conflict: ${{ steps.merge.outputs.conflict }}
+      branch: ${{ steps.upstream.outputs.branch }}
+      today: ${{ steps.upstream.outputs.today }}
+      range: ${{ steps.upstream.outputs.range }}
+      merge_sha: ${{ steps.merge.outputs.merge_sha }}
+      upstream_sha: ${{ steps.upstream.outputs.upstream_sha }}
+      base_sha: ${{ steps.upstream.outputs.base_sha }}
+      github_changed: ${{ steps.upstream.outputs.github_changed }}
     steps:
       - name: Checkout our main
         uses: actions/checkout@v4
         with:
+          ref: ${{ env.BASE_BRANCH }}
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: false
 
-      - name: Add upstream remote + fetch
-        run: |
-          git remote add upstream https://github.com/Oct4Pie/zero-zerogpt.git
-          git fetch --no-tags upstream "$UPSTREAM_REF"
-        env:
-          UPSTREAM_REF: ${{ github.event.inputs.ref }}
-
-      - name: Merge upstream into main
+      - name: Fetch upstream
+        id: upstream
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git merge --no-edit "FETCH_HEAD" \
-            -m "chore: sync with upstream (${UPSTREAM_REF} -> main)"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "$UP"
+          upstream_sha=$(git rev-parse FETCH_HEAD)
+          today=$(date -u +%F)
+          # Upstream's current contents already present on main? If yes, no-op.
+          if git merge-base --is-ancestor "$upstream_sha" "origin/${BASE_BRANCH}"; then
+            echo "Upstream ${upstream_sha} is already merged. Nothing to do."
+            echo "new=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          base_sha=$(git merge-base "origin/${BASE_BRANCH}" "$upstream_sha")
+          branch="sync/${today}-${upstream_sha:0:8}"
+          {
+            echo "new=true"
+            echo "today=${today}"
+            echo "branch=${branch}"
+            echo "upstream_sha=${upstream_sha}"
+            echo "base_sha=${base_sha}"
+            echo "range=${base_sha:0:8}..${upstream_sha:0:8}"
+            echo "compare_url=https://github.com/${UPSTREAM_REPO}/compare/${base_sha}...${upstream_sha}"
+            echo "commit_count=$(git rev-list --count "${base_sha}..${upstream_sha}")"
+          } >> "$GITHUB_OUTPUT"
+          # Did upstream change anything under .github/? (would run with our secrets)
+          if git diff --quiet "$base_sha" "$upstream_sha" -- .github; then
+            echo "github_changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "github_changed=true" >> "$GITHUB_OUTPUT"
+          fi
         env:
-          UPSTREAM_REF: ${{ github.event.inputs.ref }}
+          UP: ${{ github.event.inputs.ref || env.UPSTREAM_BRANCH }}
 
-      - name: Push merged main
-        run: git push origin HEAD:main
+      - name: Merge upstream
+        id: merge
+        if: steps.upstream.outputs.new == 'true'
+        env:
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.upstream_sha }}
+          RANGE: ${{ steps.upstream.outputs.range }}
+          BRANCH: ${{ steps.upstream.outputs.branch }}
+          UPSTREAM_REPO: ${{ env.UPSTREAM_REPO }}
+          UPSTREAM_BRANCH: ${{ env.UPSTREAM_BRANCH }}
+          BASE_BRANCH: ${{ env.BASE_BRANCH }}
+        run: |
+          git checkout -B "$BRANCH" "origin/${BASE_BRANCH}"
+          echo "merge_sha=$(git merge --no-ff --no-edit -m "Merge upstream ${UPSTREAM_REPO}/${UPSTREAM_BRANCH} (${RANGE})" "$UPSTREAM_SHA" >/dev/null 2>&1 && git rev-parse HEAD || echo 'CONFLICT')" >> "$GITHUB_OUTPUT"
+          if git diff --name-only --diff-filter=U | grep -q .; then
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            echo "Conflicting files:"
+            git diff --name-only --diff-filter=U
+          else
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Write reports and merge bundle
+        id: pkg
+        if: steps.upstream.outputs.new == 'true'
+        env:
+          REVIEWED_SHA: ${{ inputs.reviewed_upstream_sha }}
+          TODAY: ${{ steps.upstream.outputs.today }}
+          RANGE: ${{ steps.upstream.outputs.range }}
+          COMPARE_URL: ${{ steps.upstream.outputs.compare_url }}
+          COMMIT_COUNT: ${{ steps.upstream.outputs.commit_count }}
+          BASE_SHA: ${{ steps.upstream.outputs.base_sha }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.upstream_sha }}
+          BRANCH: ${{ steps.upstream.outputs.branch }}
+          CONFLICT: ${{ steps.merge.outputs.conflict }}
+        run: |
+          out="${RUNNER_TEMP}/sync"
+          mkdir -p "$out"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH" "origin/${BASE_BRANCH}" >/dev/null
+          if [ "$CONFLICT" = "true" ]; then
+            git merge --no-ff --no-edit "$UPSTREAM_SHA" >/dev/null 2>&1 || true
+            {
+              echo "Merging ${UPSTREAM_REPO}/${UPSTREAM_BRANCH} into ${BASE_BRANCH} CONFLICTS (${TODAY})."
+              echo; echo "Upstream range: [$RANGE]($COMPARE_URL) ($COMMIT_COUNT commits)"
+              echo; echo 'Conflicting files:'; echo; echo '```'
+              git diff --name-only --diff-filter=U
+              echo '```'; echo
+              echo "Nothing was pushed to main. Resolve manually."
+            } > "$out/conflict.md"
+            # bundle of the (still-conflicted) pre-merge main for inspection
+            git checkout -B "$BRANCH" "origin/${BASE_BRANCH}" >/dev/null
+            git bundle create "$out/sync.bundle" HEAD "^origin/${BASE_BRANCH}" 2>/dev/null || \
+              git bundle create "$out/sync.bundle" HEAD
+            echo "conflict=true" >> "$GITHUB_OUTPUT" \
+               && echo "merge_sha=$(git rev-parse origin/${BASE_BRANCH})" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # clean merge: produce the merge commit, then the bundle of just that commit
+          git merge --no-ff --no-edit -m "Merge upstream ${UPSTREAM_REPO}/${UPSTREAM_BRANCH} (${RANGE})" "$UPSTREAM_SHA" >/dev/null
+          merge_sha=$(git rev-parse HEAD)
+          # the merge's first parent is our main tip, so it's a fast-forward to main
+          git bundle create "$out/sync.bundle" HEAD "^origin/${BASE_BRANCH}"
+          {
+            echo "- Upstream range: [$RANGE]($COMPARE_URL) ($COMMIT_COUNT commits)"
+            echo "- Upstream commit: \`${UPSTREAM_SHA:0:10}\`"
+          } > "$out/summary.md"
+          echo "merge_sha=${merge_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Run upstream's test suite (build gate)
+        id: gate
+        if: steps.upstream.outputs.new == 'true' && steps.merge.outputs.conflict == 'false'
+        run: |
+          # Executes upstream code. This job is contents:read only, so even if
+          # upstream code tries to exfiltrate $GITHUB_TOKEN it only gets a token
+          # that can't push or read anything beyond this public fork.
+          set -e
+          node --version; npm --version
+          npm ci --no-audit --no-fund
+          npm test -- --watchAll=false --passWithNoTests
+          # Mirror the Docker build exactly so the gate == the real build.
+          PUBLIC_URL=/ CI=true GENERATE_SOURCEMAP=false npm run build
+        env:
+          CI: true
+
+      - name: Record gate result (also runs when the gate fails)
+        if: steps.upstream.outputs.new == 'true' && steps.merge.outputs.conflict == 'false'
+        run: |
+          out="${RUNNER_TEMP}/sync"
+          # steps.gate.outcome is 'failure' if the `run` above exited non-zero
+          if [ "${{ steps.gate.outcome }}" = "success" ]; then
+            echo "test_result=passed" > "$out/result"
+            echo "npm test + build passed" > "$out/summary"
+          else
+            echo "test_result=failed" > "$out/result"
+            echo "npm test or build FAILED (see run log) — not pushed to main." > "$out/summary"
+          fi
+
+      - name: Upload merge + result
+        if: always() && steps.upstream.outputs.new == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-bundle
+          path: ${{ runner.temp }}/sync
+          retention-days: 7
+
+  publish:
+    name: Push to main and rebuild (write token, no upstream code)
+    needs: sync
+    if: always() && needs.sync.outputs.new == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    env:
+      BRANCH: ${{ needs.sync.outputs.branch }}
+      MERGE_SHA: ${{ needs.sync.outputs.merge_sha }}
+      UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
+    steps:
+      - name: Download merge bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: sync-bundle
+          path: ${{ runner.temp }}/sync
+
+      - name: Rebuild from the exact tested commit
+        id: apply
+        env:
+          BASE: ${{ env.BASE_BRANCH }}
+        run: |
+          git init -q repo && cd repo
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --no-tags origin "${BASE}:refs/remotes/origin/${BASE}"
+          git fetch -q "${RUNNER_TEMP}/sync/sync.bundle" HEAD
+          fetched=$(git rev-parse FETCH_HEAD)
+          echo "::notice::Bundle head=${fetched:0:12}  expected_merge=${MERGE_SHA:0:12}"
+          git checkout -B main FETCH_HEAD
+          result=$(head -c 10 "${RUNNER_TEMP}/sync/result" 2>/dev/null)
+          echo "test_result=${result:-passed}" > "$GITHUB_OUTPUT"
+          echo "conflict=$([ -f "${RUNNER_TEMP}/sync/conflict.md" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Block unreviewed .github/ changes
+        if: needs.sync.outputs.github_changed == 'true'
+        env:
+          REVIEWED_SHA: ${{ github.event.inputs.reviewed_upstream_sha || '' }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
+        run: |
+          # Upstream changed a file under .github/. Once merged, that workflow
+          # could run with this repo's secrets, so it needs a human first.
+          # The reviewed SHA must be the *exact* upstream commit we are merging
+          # (not "current upstream HEAD" — that could move between runs).
+          if [[ "$REVIEWED_SHA" =~ ^[0-9a-f]{40}$ ]] && [ "$REVIEWED_SHA" = "$UPSTREAM_SHA" ]; then
+            echo "::notice::.github/ changes reviewed at $UPSTREAM_SHA; proceeding."
+          else
+            echo "::error::Upstream changed files under .github/. Re-run Sync upstream with reviewed_upstream_sha set to the exact upstream commit SHA being merged."
+            {
+              echo "Upstream changed files under \`.github/\` in commit \`${UPSTREAM_SHA:0:10}\`."
+              echo
+              echo "Review: https://github.com/${UPSTREAM_REPO}/commit/${UPSTREAM_SHA}"
+              echo
+              echo "After reviewing, run **Sync upstream** with \`reviewed_upstream_sha\` = \`${UPSTREAM_SHA}\`."
+            } > "${RUNNER_TEMP}/blocked.md"
+            exit 1
+          fi
+
+      - name: Fail on conflict (nothing pushed)
+        if: steps.apply.outputs.conflict == 'true'
+        run: |
+          # No inspect branch — pushing our pre-merge main is a no-op. The
+          # step summary already carries the conflict report with the compare URL.
+          {
+            echo "::error::Upstream merge CONFLICTED. Nothing was pushed to main."
+            echo
+            echo "## Conflicting files"
+            echo
+          } >> "${GITHUB_STEP_SUMMARY}"
+          cat "${RUNNER_TEMP}/sync/conflict.md" 2>/dev/null | tail -n +1 >> "${GITHUB_STEP_SUMMARY}" || true
+          exit 1
+
+      - name: Publish test/build failure (nothing changes on main)
+        if: steps.apply.outputs.conflict != 'true' && steps.apply.outputs.test_result == 'failed'
+        run: |
+          git -C repo push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" \
+            "main:refs/heads/${BRANCH}-failed" || true
+          {
+            echo "::error::npm test / build FAILED after merge. Nothing was pushed to main."
+            echo "Inspect branch: \`${BRANCH}-failed\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          exit 1
+
+      - name: Push to main + trigger Docker & Pages
+        if: steps.apply.outputs.conflict != 'true' && steps.apply.outputs.test_result != 'failed'
+        run: |
+          set -e
+          # main is at FETCH_HEAD (the merge commit); its first parent is the
+          # remote main tip, so this is a fast-forward push of the tested commit.
+          git -C repo push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" "main:main"
+          # A GITHUB_TOKEN push does NOT auto-trigger on:push workflows, so kick
+          # the image build and the Pages deploy explicitly.
+          export GH_TOKEN=${{ secrets.GITHUB_TOKEN }}
+          echo "::notice::Triggering Docker image build (docker.yml)"
+          gh workflow run docker.yml
+          echo "::notice::Triggering GitHub Pages deploy (deploy.yml)"
+          gh workflow run deploy.yml || echo "::warning::deploy.yml run request failed — check the GitHub Pages tab."
