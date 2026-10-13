@@ -239,9 +239,6 @@ jobs:
       MERGE_SHA: ${{ needs.sync.outputs.merge_sha }}
       UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
       SYNC_LABEL: upstream-sync
-      UPSTREAM_REPO: ${{ env.UPSTREAM_REPO }}
-      UPSTREAM_BRANCH: ${{ env.UPSTREAM_BRANCH }}
-      RUN_URL: ${{ env.RUN_URL }}
     steps:
       - name: Download merge bundle
         uses: actions/download-artifact@v4
