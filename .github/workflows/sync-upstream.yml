@@ -233,10 +233,15 @@ jobs:
     permissions:
       contents: write
       actions: write
+      issues: write
     env:
       BRANCH: ${{ needs.sync.outputs.branch }}
       MERGE_SHA: ${{ needs.sync.outputs.merge_sha }}
       UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
+      SYNC_LABEL: upstream-sync
+      UPSTREAM_REPO: ${{ env.UPSTREAM_REPO }}
+      UPSTREAM_BRANCH: ${{ env.UPSTREAM_BRANCH }}
+      RUN_URL: ${{ env.RUN_URL }}
     steps:
       - name: Download merge bundle
         uses: actions/download-artifact@v4
@@ -262,53 +267,102 @@ jobs:
           echo "test_result=${result:-passed}" > "$GITHUB_OUTPUT"
           echo "conflict=$([ -f "${RUNNER_TEMP}/sync/conflict.md" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
-      - name: Block unreviewed .github/ changes
+      - name: Prepare issue reporting
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create "$SYNC_LABEL" --repo "$GITHUB_REPOSITORY" --color 5319e7 \
+            --description "Automated upstream sync needs attention" 2>/dev/null || true
+          # report_issue <kind> <title> <body-file>: comments on the open
+          # upstream-sync issue (or opens one), once per kind + upstream commit.
+          cat > "${RUNNER_TEMP}/report_issue.sh" <<'SH'
+          report_issue() {
+            kind=$1; title=$2; body=$3
+            marker="<!-- upstream-sync:${kind}:${UPSTREAM_SHA} -->"
+            printf '\n%s\n' "$marker" >> "$body"
+            issues=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --label "$SYNC_LABEL" \
+              --limit 100 --json number --jq '[.[] | .number]')
+            for issue in $issues; do
+              if gh issue view "$issue" --repo "$GITHUB_REPOSITORY" --comments --json body,comments \
+                   --jq '[.body] + [.comments[].body] | join("\n")' | grep -qF "$marker"; then
+                echo "Already reported on issue #${issue}."
+                return 0
+              fi
+            done
+            first=$(head -n 1 <<<"$issues")
+            if [ -n "$first" ]; then
+              gh issue comment "$first" --repo "$GITHUB_REPOSITORY" --body-file "$body"
+            else
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --label "$SYNC_LABEL" --body-file "$body"
+            fi
+          }
+          SH
+
+      - name: Report .github/ changes awaiting review
         if: needs.sync.outputs.github_changed == 'true'
         env:
-          REVIEWED_SHA: ${{ github.event.inputs.reviewed_upstream_sha || '' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
+          REVIEWED_SHA: ${{ github.event.inputs.reviewed_upstream_sha || '' }}
         run: |
           # Upstream changed a file under .github/. Once merged, that workflow
           # could run with this repo's secrets, so it needs a human first.
-          # The reviewed SHA must be the *exact* upstream commit we are merging
-          # (not "current upstream HEAD" — that could move between runs).
           if [[ "$REVIEWED_SHA" =~ ^[0-9a-f]{40}$ ]] && [ "$REVIEWED_SHA" = "$UPSTREAM_SHA" ]; then
-            echo "::notice::.github/ changes reviewed at $UPSTREAM_SHA; proceeding."
-          else
-            echo "::error::Upstream changed files under .github/. Re-run Sync upstream with reviewed_upstream_sha set to the exact upstream commit SHA being merged."
-            {
-              echo "Upstream changed files under \`.github/\` in commit \`${UPSTREAM_SHA:0:10}\`."
-              echo
-              echo "Review: https://github.com/${UPSTREAM_REPO}/commit/${UPSTREAM_SHA}"
-              echo
-              echo "After reviewing, run **Sync upstream** with \`reviewed_upstream_sha\` = \`${UPSTREAM_SHA}\`."
-            } > "${RUNNER_TEMP}/blocked.md"
-            exit 1
+            echo "::notice::.github/ changes reviewed at $UPSTREAM_SHA."
+            exit 0
           fi
-
-      - name: Fail on conflict (nothing pushed)
-        if: steps.apply.outputs.conflict == 'true'
-        run: |
-          # No inspect branch — pushing our pre-merge main is a no-op. The
-          # step summary already carries the conflict report with the compare URL.
+          echo "::error::Upstream changed files under .github/. Re-run Sync upstream with reviewed_upstream_sha = $UPSTREAM_SHA after reviewing."
+          # shellcheck source=/dev/null
+          . "${RUNNER_TEMP}/report_issue.sh"
+          body="${RUNNER_TEMP}/issue.md"
           {
-            echo "::error::Upstream merge CONFLICTED. Nothing was pushed to main."
+            echo "Upstream changed files under \`.github/\` in commit \`${UPSTREAM_SHA:0:10}\`. Nothing was pushed: a push would run these workflow changes with this repo's secrets before review."
+            echo "Run: ${RUN_URL}"
             echo
-            echo "## Conflicting files"
+            echo "Review: https://github.com/${UPSTREAM_REPO}/commit/${UPSTREAM_SHA}"
             echo
-          } >> "${GITHUB_STEP_SUMMARY}"
-          cat "${RUNNER_TEMP}/sync/conflict.md" 2>/dev/null | tail -n +1 >> "${GITHUB_STEP_SUMMARY}" || true
+            echo "After reviewing, run **Sync upstream** with \`reviewed_upstream_sha\` set to \`${UPSTREAM_SHA}\`."
+          } > "$body"
+          report_issue github-changes "Upstream sync: workflow changes need review" "$body"
+          # still fail the run so it is obvious nothing was pushed
           exit 1
 
-      - name: Publish test/build failure (nothing changes on main)
-        if: steps.apply.outputs.conflict != 'true' && steps.apply.outputs.test_result == 'failed'
+      - name: Report merge conflict
+        if: steps.apply.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
         run: |
+          # shellcheck source=/dev/null
+          . "${RUNNER_TEMP}/report_issue.sh"
+          body="${RUNNER_TEMP}/issue.md"
+          { cat "${RUNNER_TEMP}/sync/conflict.md" 2>/dev/null; echo; echo "Run: ${RUN_URL}"; } > "$body"
+          report_issue conflict "Upstream sync: conflict" "$body"
+          echo "::error::Upstream merge CONFLICTED. Nothing was pushed to main."
+          exit 1
+
+      - name: Report test/build failure
+        if: steps.apply.outputs.conflict != 'true' && steps.apply.outputs.test_result == 'failed'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
+        run: |
+          # Leave the failed merge on an inspect branch so it can be examined.
           git -C repo push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" \
-            "main:refs/heads/${BRANCH}-failed" || true
+            "main:refs/heads/${BRANCH}-tests-failed" || true
+          # shellcheck source=/dev/null
+          . "${RUNNER_TEMP}/report_issue.sh"
+          body="${RUNNER_TEMP}/issue.md"
           {
-            echo "::error::npm test / build FAILED after merge. Nothing was pushed to main."
-            echo "Inspect branch: \`${BRANCH}-failed\`"
-          } >> "${GITHUB_STEP_SUMMARY}"
+            echo "npm test / build FAILED after merging \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\`. Nothing was pushed to main."
+            echo
+            cat "${RUNNER_TEMP}/sync/summary" 2>/dev/null || echo "(no summary)"
+            echo "- Inspect branch: \`${BRANCH}-tests-failed\`"
+            echo "- Run log: ${RUN_URL}"
+          } > "$body"
+          report_issue tests-failed "Upstream sync: tests failing" "$body"
+          echo "::error::npm test / build FAILED after merge. Nothing was pushed to main."
           exit 1
 
       - name: Push to main + trigger Docker & Pages
